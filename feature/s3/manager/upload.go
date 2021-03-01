@@ -3,10 +3,13 @@ package manager
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws/middleware"
@@ -206,22 +209,7 @@ func NewUploader(client UploadAPIClient, options ...func(*Uploader)) *Uploader {
 	return u
 }
 
-// Upload uploads an object to S3, intelligently buffering large
-// files into smaller chunks and sending them in parallel across multiple
-// goroutines. You can configure the buffer size and concurrency through the
-// Uploader parameters.
-//
-// Additional functional options can be provided to configure the individual
-// upload. These options are copies of the Uploader instance Upload is called from.
-// Modifying the options will not impact the original Uploader instance.
-//
-// Use the WithUploaderRequestOptions helper function to pass in request
-// options that will be applied to all API operations made with this uploader.
-//
-// It is safe to call this method concurrently across goroutines.
-func (u Uploader) Upload(ctx context.Context, input *s3.PutObjectInput, opts ...func(*Uploader)) (*UploadOutput, error) {
-	i := uploader{in: input, cfg: u, ctx: ctx}
-
+func (u Uploader) uploadWithSingleUploader(i uploader, opts ...func(*Uploader)) (*UploadOutput, error) {
 	// Copy ClientOptions
 	clientOptions := make([]func(*s3.Options), 0, len(i.cfg.ClientOptions)+1)
 	clientOptions = append(clientOptions, func(o *s3.Options) {
@@ -237,12 +225,52 @@ func (u Uploader) Upload(ctx context.Context, input *s3.PutObjectInput, opts ...
 	return i.upload()
 }
 
+// Upload uploads an object to S3, intelligently buffering large
+// files into smaller chunks and sending them in parallel across multiple
+// goroutines. You can configure the buffer size and concurrency through the
+// Uploader parameters.
+//
+// Additional functional options can be provided to configure the individual
+// upload. These options are copies of the Uploader instance Upload is called from.
+// Modifying the options will not impact the original Uploader instance.
+//
+// Use the WithUploaderRequestOptions helper function to pass in request
+// options that will be applied to all API operations made with this uploader.
+//
+// It is safe to call this method concurrently across goroutines.
+func (u Uploader) Upload(ctx context.Context, input *s3.PutObjectInput, opts ...func(*Uploader)) (*UploadOutput, error) {
+	return u.uploadWithSingleUploader(uploader{in: input, cfg: u, ctx: ctx}, opts...)
+
+}
+
+// ResumeUpload resumes an existing multipart upload to S3, intelligently buffering
+// large files into smaller chunks and sending them in parallel across multiple
+// goroutines. You can configure the buffer size and concurrency through the
+// Uploader parameters. The parts that are already uploaded have their md5
+// checkums computed locally and compared with their uploaded ETag. If these do
+// not match the upload fails. This is to ensure the integrity of the resumed
+// multipart upload in case the data or part size differs from the original
+// multipart upload.
+//
+// Additional functional options can be provided to configure the individual
+// upload. These options are copies of the Uploader instance Upload is called from.
+// Modifying the options will not impact the original Uploader instance.
+//
+// Use the WithUploaderRequestOptions helper function to pass in request
+// options that will be applied to all API operations made with this uploader.
+//
+// It is safe to call this method concurrently across goroutines.
+func (u Uploader) ResumeUpload(ctx context.Context, input *s3.PutObjectInput, uploadID *string, opts ...func(*Uploader)) (*UploadOutput, error) {
+	return u.uploadWithSingleUploader(uploader{in: input, cfg: u, existingUploadID: uploadID, ctx: ctx}, opts...)
+}
+
 // internal structure to manage an upload to S3.
 type uploader struct {
 	ctx context.Context
 	cfg Uploader
 
-	in *s3.PutObjectInput
+	in               *s3.PutObjectInput
+	existingUploadID *string
 
 	readerPos int64 // current reader position
 	totalSize int64 // set to -1 if the size is not known
@@ -269,7 +297,7 @@ func (u *uploader) upload() (*UploadOutput, error) {
 		return nil, fmt.Errorf("read upload data failed: %w", err)
 	}
 
-	mu := multiuploader{uploader: u}
+	mu := multiuploader{uploader: u, eTagByPartNumber: make(map[int32]string)}
 	return mu.upload(reader, cleanup)
 }
 
@@ -450,11 +478,12 @@ func (c *recordLocationClient) Do(r *http.Request) (resp *http.Response, err err
 // internal structure to manage a specific multipart upload to S3.
 type multiuploader struct {
 	*uploader
-	wg       sync.WaitGroup
-	m        sync.Mutex
-	err      error
-	uploadID string
-	parts    completedParts
+	wg               sync.WaitGroup
+	m                sync.Mutex
+	err              error
+	uploadID         string
+	parts            completedParts
+	eTagByPartNumber map[int32]string
 }
 
 // keeps track of a single chunk of data being sent to S3.
@@ -475,17 +504,39 @@ func (a completedParts) Less(i, j int) bool { return a[i].PartNumber < a[j].Part
 // upload will perform a multipart upload using the firstBuf buffer containing
 // the first chunk of data.
 func (u *multiuploader) upload(firstBuf io.ReadSeeker, cleanup func()) (*UploadOutput, error) {
-	params := &s3.CreateMultipartUploadInput{}
-	awsutil.Copy(params, u.in)
-
-	// Create the multipart
+	var err error
 	var locationRecorder recordLocationClient
-	resp, err := u.cfg.S3.CreateMultipartUpload(u.ctx, params, append(u.cfg.ClientOptions, locationRecorder.WrapClient())...)
-	if err != nil {
-		cleanup()
-		return nil, err
+	if u.uploader.existingUploadID != nil {
+		u.uploadID = *u.uploader.existingUploadID
+		params := &s3.ListPartsInput{}
+		awsutil.Copy(params, u.in)
+		params.UploadId = u.uploader.existingUploadID
+		paginator := s3.NewListPartsPaginator(u.cfg.S3, params)
+		for paginator.HasMorePages() {
+			parts, err := paginator.NextPage(u.ctx, append(u.cfg.ClientOptions, locationRecorder.WrapClient())...)
+			if err != nil {
+				return nil, err
+			}
+			for _, part := range parts.Parts {
+				eTag, err := strconv.Unquote(*part.ETag)
+				if err != nil {
+					return nil, err
+				}
+				u.eTagByPartNumber[part.PartNumber] = eTag
+			}
+		}
+	} else {
+		params := &s3.CreateMultipartUploadInput{}
+		awsutil.Copy(params, u.in)
+
+		// Create the multipart
+		resp, err := u.cfg.S3.CreateMultipartUpload(u.ctx, params, append(u.cfg.ClientOptions, locationRecorder.WrapClient())...)
+		if err != nil {
+			cleanup()
+			return nil, err
+		}
+		u.uploadID = *resp.UploadId
 	}
-	u.uploadID = *resp.UploadId
 
 	// Create the workers
 	ch := make(chan chunk, u.cfg.Concurrency)
@@ -580,7 +631,11 @@ func (u *multiuploader) readChunk(ch chan chunk) {
 			break
 		}
 
-		if u.geterr() == nil {
+		if eTag, present := u.eTagByPartNumber[data.num]; present {
+			if err := u.check(data, &eTag); err != nil {
+				u.seterr(err)
+			}
+		} else if u.geterr() == nil {
 			if err := u.send(data); err != nil {
 				u.seterr(err)
 			}
@@ -588,6 +643,30 @@ func (u *multiuploader) readChunk(ch chan chunk) {
 
 		data.cleanup()
 	}
+}
+
+// completePart keeps track of completed part information
+func (u *multiuploader) completePart(c chunk, eTag *string) {
+	n := c.num
+	completed := types.CompletedPart{ETag: eTag, PartNumber: n}
+
+	u.m.Lock()
+	u.parts = append(u.parts, completed)
+	u.m.Unlock()
+}
+
+// check checks if a chunk's checksum matches its parts ETAG
+// and keeps track of the completed part information
+func (u *multiuploader) check(c chunk, eTag *string) error {
+	summer := md5.New()
+	io.Copy(summer, c.buf)
+	sum := hex.EncodeToString(summer.Sum([]byte{}))
+	if sum != *eTag {
+		return fmt.Errorf("checksum did not match for chunk %d, multipart upload out of sync with local file", c.num)
+	}
+
+	u.completePart(c, eTag)
+	return nil
 }
 
 // send performs an UploadPart request and keeps track of the completed
@@ -608,12 +687,7 @@ func (u *multiuploader) send(c chunk) error {
 		return err
 	}
 
-	n := c.num
-	completed := types.CompletedPart{ETag: resp.ETag, PartNumber: n}
-
-	u.m.Lock()
-	u.parts = append(u.parts, completed)
-	u.m.Unlock()
+	u.completePart(c, resp.ETag)
 
 	return nil
 }

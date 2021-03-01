@@ -25,6 +25,7 @@ type UploadLoggingClient struct {
 	CreateMultipartUploadFn   func(*UploadLoggingClient, *s3.CreateMultipartUploadInput) (*s3.CreateMultipartUploadOutput, error)
 	CompleteMultipartUploadFn func(*UploadLoggingClient, *s3.CompleteMultipartUploadInput) (*s3.CompleteMultipartUploadOutput, error)
 	AbortMultipartUploadFn    func(*UploadLoggingClient, *s3.AbortMultipartUploadInput) (*s3.AbortMultipartUploadOutput, error)
+	ListPartsFn               func(*UploadLoggingClient, *s3.ListPartsInput) (*s3.ListPartsOutput, error)
 
 	ignoredOperations []string
 
@@ -175,6 +176,23 @@ func (u *UploadLoggingClient) AbortMultipartUpload(ctx context.Context, params *
 	}
 
 	return &s3.AbortMultipartUploadOutput{}, nil
+}
+
+// ListParts is the S3 ListParts API.
+func (u *UploadLoggingClient) ListParts(ctx context.Context, params *s3.ListPartsInput, optFns ...func(*s3.Options)) (*s3.ListPartsOutput, error) {
+	u.m.Lock()
+	defer u.m.Unlock()
+
+	u.traceOperation("ListMultipartUploads", params)
+	if err := u.simulateHTTPClientOption(optFns...); err != nil {
+		return nil, err
+	}
+
+	if u.AbortMultipartUploadFn != nil {
+		return u.ListPartsFn(u, params)
+	}
+
+	return &s3.ListPartsOutput{}, nil
 }
 
 // NewUploadLoggingClient returns a new UploadLoggingClient.

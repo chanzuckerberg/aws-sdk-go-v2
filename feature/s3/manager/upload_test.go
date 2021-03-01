@@ -963,18 +963,94 @@ func TestUploadBufferStrategy(t *testing.T) {
 	}
 }
 
+func TestUploadRecovery(tt *testing.T) {
+	oneFailed := "upload multipart failed, upload id: 123, cause: checksum did not match for chunk 1, multipart upload out of sync with local file"
+	cases := map[string]struct {
+		parts         map[int32]string
+		expectedError *string
+	}{
+		"BadChecksum": {
+			parts: map[int32]string{
+				1: "junk",
+			},
+			expectedError: &oneFailed,
+		},
+		"GoodChecksums": {
+			parts: map[int32]string{
+				1: "5f363e0e58a95f06cbe9bbc662c5dfb6",
+				4: "5f363e0e58a95f06cbe9bbc662c5dfb6",
+			},
+		},
+	}
+
+	for name, tCase := range cases {
+		tt.Run(name, func(t *testing.T) {
+			partSize := 5242880
+			partCount := 10
+			fileSize := partSize * partCount
+
+			f, testFileCleanup, err := createTempFile(tt, int64(fileSize))
+			if err != nil {
+				t.Error(err)
+			}
+			defer testFileCleanup(tt)
+
+			mux := newMockS3UploadServer(t, buildFailHandlers(t, partCount, 0), tCase.parts)
+			server := httptest.NewServer(mux)
+			defer server.Close()
+
+			client := s3.New(s3.Options{
+				EndpointResolver: s3testing.EndpointResolverFunc(func(region string, options s3.EndpointResolverOptions) (aws.Endpoint, error) {
+					return aws.Endpoint{
+						URL: server.URL,
+					}, nil
+				}),
+				UsePathStyle: true,
+			})
+
+			uploader := manager.NewUploader(client, func(u *manager.Uploader) {
+				u.PartSize = int64(partSize)
+			})
+
+			uploadID := "123"
+			_, err = uploader.ResumeUpload(context.Background(), &s3.PutObjectInput{
+				Bucket: aws.String("bucket"),
+				Key:    aws.String("key"),
+				Body:   f,
+			}, &uploadID)
+
+			if err != nil && tCase.expectedError == nil {
+				t.Errorf("expected error to be nil but error was: %s", err)
+			}
+			if err == nil && tCase.expectedError != nil {
+				t.Errorf("expected error: '%s' but it was nil", *tCase.expectedError)
+			}
+			if err != nil && tCase.expectedError != nil && err.Error() != *tCase.expectedError {
+				t.Errorf("expected error: '%s' but got error: '%s'", *tCase.expectedError, err.Error())
+			}
+		})
+	}
+
+}
+
 type mockS3UploadServer struct {
 	*http.ServeMux
 
 	tb          testing.TB
 	partHandler []http.Handler
+	parts       map[int32]string
 }
 
-func newMockS3UploadServer(tb testing.TB, partHandler []http.Handler) *mockS3UploadServer {
+func newMockS3UploadServer(tb testing.TB, partHandler []http.Handler, parts ...map[int32]string) *mockS3UploadServer {
 	s := &mockS3UploadServer{
 		ServeMux:    http.NewServeMux(),
 		partHandler: partHandler,
 		tb:          tb,
+		parts:       make(map[int32]string),
+	}
+
+	if len(parts) > 0 {
+		s.parts = parts[0]
 	}
 
 	s.HandleFunc("/", s.handleRequest)
@@ -985,9 +1061,22 @@ func newMockS3UploadServer(tb testing.TB, partHandler []http.Handler) *mockS3Upl
 func (s mockS3UploadServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
-	_, hasUploads := r.URL.Query()["uploads"]
+	query := r.URL.Query()
+	_, hasUploads := query["uploads"]
+	_, hasUploadId := query["uploadId"]
 
 	switch {
+	case r.Method == "GET" && hasUploadId:
+		parts := make([]string, 0)
+		for num, eTag := range s.parts {
+			parts = append(parts, fmt.Sprintf(`<Part>
+				<ETag>"%s"</ETag>
+				<PartNumber>%d</PartNumber>
+			</Part>`, eTag, num))
+		}
+		response := fmt.Sprintf(listPartsResp, strings.Join(parts, ""))
+		w.Header().Set("Content-Length", strconv.Itoa(len(response)))
+		w.Write([]byte(response))
 	case r.Method == "POST" && hasUploads:
 		// CreateMultipartUpload
 		w.Header().Set("Content-Length", strconv.Itoa(len(createUploadResp)))
@@ -1133,3 +1222,5 @@ const completeUploadResp = `<CompleteMultipartUploadResponse>
 </CompleteMultipartUploadResponse>`
 
 const abortUploadResp = `<AbortMultipartUploadResponse></AbortMultipartUploadResponse>`
+
+const listPartsResp = `<ListPartsResult>%s</ListPartsResult>`
